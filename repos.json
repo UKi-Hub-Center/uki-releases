@@ -1,0 +1,9 @@
+{
+  "owner": "UKi-Hub-Center",
+  "maxReleasesPerRepo": 10,
+  "repos": [
+    { "name": "uki-tutor-ui", "title": "Web & mobile app", "blurb": "React + Capacitor client" },
+    { "name": "uki-tutor-service", "title": "API", "blurb": "Go backend" },
+    { "name": "uki-admin-service", "title": "Admin", "blurb": "Go backend + admin panel" }
+  ]
+}

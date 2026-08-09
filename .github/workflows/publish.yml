@@ -1,0 +1,72 @@
+name: Publish release site
+
+# Renders the public release-notes page and deploys it to GitHub Pages.
+#
+# This repo exists only because GitHub Pages cannot publish from a private
+# repository on the org's current (Free) plan, and every product repo is
+# private. It contains no product source — just this workflow and the generator
+# that reads the product repos' GitHub Releases over the API.
+#
+# repository_dispatch is the fast path: each product repo pings this workflow
+# right after release-please publishes a release. The nightly schedule is the
+# backstop, because that ping is best-effort by design — a failed dispatch must
+# never turn a completed release red in the repo that produced it.
+on:
+  repository_dispatch:
+    types: [release-published]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      # The redaction rules fail silently and publicly if they break: the page
+      # still builds and still looks right, it just fills with links that 404
+      # for every visitor. Guard them before publishing anything.
+      - name: Test redaction rules
+        run: node --test 'scripts/*.test.mjs'
+
+      # No `npm ci` — this project deliberately has no dependencies and no
+      # lockfile. It is a public repo; every dependency added here would be a
+      # supply-chain surface on the one thing in the org that anyone can read.
+      #
+      # client_payload from repository_dispatch is attacker-supplied in
+      # principle and is deliberately never read: which repos get published is
+      # decided by repos.json in this repo, not by whoever fired the event.
+      - name: Build site
+        env:
+          GH_TOKEN: ${{ secrets.UKI_RELEASES_READ_PAT }}
+        run: node scripts/build.mjs
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
