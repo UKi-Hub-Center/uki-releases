@@ -107,9 +107,214 @@ export async function gatherReleases(config) {
       })
     }
 
-    sections.push({ ...repo, releases })
+    const banner = await computeServiceBanner(owner, repo, releases)
+    sections.push({ ...repo, releases, banner })
     console.log(`  ${repo.name}: ${releases.length} release(s)`)
   }
 
   return { owner, sections, generatedAt: new Date().toISOString() }
+}
+
+// ---------------------------------------------------------------------------
+// "Now live" banners (Phase A)
+//
+// GitHub Deployments and health probes are the two new data sources here, and
+// both can carry operational detail (shas, Cloud Run hostnames, environment
+// URLs) that must never reach the public page. The discipline mirrors
+// stripPrivateLinks above: fetchDeployments/resolveTagIndex return raw data
+// that still contains shas, but buildBanner — the only place that assembles
+// what render.mjs receives — never copies a sha into its output, only a
+// resolved tag (or an explicit "untagged" fallback) and a date. There is no
+// field in the banner shape a sha could hide in.
+
+/**
+ * GitHub marks a deployment's *previous* successful status 'inactive' once a
+ * newer one supersedes it, so the currently-live deployment is the newest
+ * annotated 'success' — or, if newer attempts since then failed, the newest
+ * 'inactive'. `deployments` must be newest-first.
+ */
+export function pickCurrentDeployment(deployments) {
+  return (
+    deployments.find(d => d.state === 'success') ??
+    deployments.find(d => d.state === 'inactive') ??
+    null
+  )
+}
+
+/**
+ * Newest live deployment per environment. Walks each environment's
+ * deployments newest-first, fetching one status at a time and stopping as
+ * soon as pickCurrentDeployment can give a final answer — mirrors the lazy
+ * walk in uki-tutor-infra/scripts/status/collect.mjs so a 'success' three
+ * deployments back never costs fetching statuses for the other seven.
+ *
+ * Returns `{ [env]: { sha, deployedAt } | null }`. Throws on a GitHub API
+ * error (e.g. the PAT lacks Deployments: Read) — callers that want to
+ * degrade instead of fail must catch (see computeServiceBanner).
+ */
+export async function fetchDeployments(owner, repo, environments = ['prod', 'dev'], ghFn = gh) {
+  const result = {}
+  for (const env of environments) {
+    const list = await ghFn(
+      `/repos/${owner}/${repo}/deployments?environment=${encodeURIComponent(env)}&per_page=10`,
+    )
+    const annotated = []
+    let current = null
+    for (const d of list) {
+      const statuses = await ghFn(`/repos/${owner}/${repo}/deployments/${d.id}/statuses?per_page=1`)
+      annotated.push({ sha: d.sha, createdAt: d.created_at, state: statuses[0]?.state ?? 'unknown' })
+      current = pickCurrentDeployment(annotated)
+      if (current?.state === 'success') break
+    }
+    result[env] = current ? { sha: current.sha, deployedAt: current.createdAt } : null
+  }
+  return result
+}
+
+/**
+ * A single liveness GET. Records reachable/unreachable only — no status
+ * code, no latency, nothing that would be internal detail on a public page.
+ * Never throws: an unreachable prod is a result to render (amber dot), not a
+ * build failure.
+ */
+export async function probeProd(url, { timeoutMs = 2000, retries = 1, fetchFn = fetch } = {}) {
+  if (!url) return false
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await fetchFn(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' })
+      return res.ok
+    } catch {
+      if (attempt >= retries) return false
+    }
+  }
+}
+
+/**
+ * Resolves the release tag for each deployed sha, by asking GitHub what
+ * commit each already-fetched release's tag points at. Walks releases
+ * newest-first and stops once every sha in `shas` has been matched (or the
+ * list runs out) rather than resolving all of them — most builds are a
+ * handful of releases behind, not ten.
+ */
+export async function resolveTagIndex(owner, repo, releases, shas, ghFn = gh) {
+  const remaining = new Set(shas.filter(Boolean))
+  const index = new Map()
+  if (remaining.size === 0 || !Array.isArray(releases)) return index
+
+  for (const release of releases) {
+    if (remaining.size === 0) break
+    let sha = null
+    try {
+      const commit = await ghFn(`/repos/${owner}/${repo}/commits/${encodeURIComponent(release.tag)}`)
+      sha = commit?.sha ?? null
+    } catch {
+      sha = null
+    }
+    if (sha && !index.has(sha)) {
+      index.set(sha, release.tag)
+      remaining.delete(sha)
+    }
+  }
+  return index
+}
+
+/**
+ * Resolves one environment's deployment to a display tag.
+ *
+ * If the deployed sha matches a known release exactly, that release is the
+ * tag. Otherwise the build is untagged: it falls back to the newest release
+ * published at or before the deployment, per the design spec's sha→tag
+ * mapping rule ("falls back to the newest release whose date <= the
+ * deployment's date"). `index` is this release's position in `releases`
+ * (0 = newest) — used only to compare recency between prod and dev, never
+ * rendered. Returns null when no release exists at or before the deployment
+ * (nothing meaningful to display).
+ */
+function resolveEnvEntry(deployment, releases, tagIndex) {
+  const exactTag = tagIndex.get(deployment.sha) ?? null
+  if (exactTag) {
+    return { tag: exactTag, untagged: false, index: releases.findIndex(r => r.tag === exactTag) }
+  }
+  const deployedAt = new Date(deployment.deployedAt)
+  const fallback = releases.find(r => new Date(r.publishedAt) <= deployedAt)
+  if (!fallback) return null
+  return { tag: fallback.tag, untagged: true, index: releases.findIndex(r => r.tag === fallback.tag) }
+}
+
+/**
+ * Pure assembly of the banner render.mjs consumes, from already-resolved
+ * inputs (no network here). This is the one place that decides what is safe
+ * to hand to the renderer — notably, no sha ever enters the returned shape,
+ * and `publicUrl` is only ever set to what the caller passed in, which for
+ * API/Admin is always undefined (see repos.json / computeServiceBanner).
+ *
+ * Returns null when there is nothing safe/meaningful to show (no prod
+ * deployment, or a prod deployment older than every known release) — the
+ * caller omits the banner entirely in that case.
+ */
+export function buildBanner({ prod, dev, releases, tagIndex, publicUrl, prodReachable }) {
+  if (!prod) return null
+
+  const prodEntry = resolveEnvEntry(prod, releases, tagIndex)
+  if (!prodEntry) return null
+
+  const devEntry = dev ? resolveEnvEntry(dev, releases, tagIndex) : null
+  const sameBuild = Boolean(dev) && dev.sha === prod.sha
+  const sameTag = Boolean(prodEntry.tag && devEntry?.tag && prodEntry.tag === devEntry.tag)
+  // "An untagged dev build that resolves to no newer tag than prod counts as
+  // dev == prod": dev's resolved release is at the same position or older
+  // (>= index, since 0 is newest) than prod's.
+  const noNewerThanProd = Boolean(devEntry) && devEntry.index >= prodEntry.index
+  const devEqualsProd = !devEntry || sameBuild || sameTag || noNewerThanProd
+
+  return {
+    prod: {
+      version: prodEntry.tag,
+      untagged: prodEntry.untagged,
+      date: prod.deployedAt,
+      reachable: prodReachable === true,
+    },
+    dev: devEqualsProd ? null : { version: devEntry.tag, date: dev.deployedAt },
+    publicUrl,
+  }
+}
+
+/**
+ * Orchestrates fetchDeployments + resolveTagIndex + probeProd + buildBanner
+ * for one repo, degrading to `null` (banner omitted, release notes still
+ * render) on any failure — most notably a PAT that has not yet been granted
+ * Deployments: Read, which 403s/404s.
+ */
+export async function computeServiceBanner(owner, repo, releases, deps = {}) {
+  const ghFn = deps.gh ?? gh
+  const probeFn = deps.probeProd ?? probeProd
+  const probeUrl = repo.probeUrl ?? (repo.probeUrlEnv ? process.env[repo.probeUrlEnv] : undefined)
+
+  let deployments
+  try {
+    deployments = await fetchDeployments(owner, repo.name, ['prod', 'dev'], ghFn)
+  } catch (err) {
+    console.log(`  ${repo.name}: deployments unavailable (${err.message}) — omitting "now live" banner`)
+    return null
+  }
+
+  const shas = [deployments.prod?.sha, deployments.dev?.sha].filter(Boolean)
+  let tagIndex
+  try {
+    tagIndex = await resolveTagIndex(owner, repo.name, releases, shas, ghFn)
+  } catch (err) {
+    console.log(`  ${repo.name}: release-tag lookup failed (${err.message}) — omitting "now live" banner`)
+    return null
+  }
+
+  const prodReachable = await probeFn(probeUrl)
+
+  return buildBanner({
+    prod: deployments.prod,
+    dev: deployments.dev,
+    releases,
+    tagIndex,
+    publicUrl: repo.publicUrl,
+    prodReachable,
+  })
 }

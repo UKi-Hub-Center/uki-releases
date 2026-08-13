@@ -6,7 +6,15 @@
 // every visitor. Uses node:test so this stays dependency-free.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { stripPrivateLinks } from './fetch.mjs'
+import {
+  stripPrivateLinks,
+  pickCurrentDeployment,
+  fetchDeployments,
+  probeProd,
+  resolveTagIndex,
+  buildBanner,
+  computeServiceBanner,
+} from './fetch.mjs'
 import { escapeHtml, renderPage } from './render.mjs'
 
 const OWNER = 'UKi-Hub-Center'
@@ -82,4 +90,497 @@ test('renderPage emits a complete document and the freshness stamp', () => {
   assert.ok(html.includes('Web &amp; mobile app'), 'section titles are escaped')
   // Nothing may load from a third-party origin.
   assert.ok(!/<(script|link)\b/i.test(html), 'page must stay self-contained')
+})
+
+// ---------------------------------------------------------------------------
+// "Now live" banners (Phase A)
+//
+// Fictional but realistically-shaped fixtures below: 40-hex shas, and — in
+// the leak test — the exact internal hostnames/instance names named in the
+// design brief, so a passing test is evidence against the real forbidden
+// strings, not just "some string that looks sha-ish".
+
+const SHA_V012 = 'c3'.repeat(20) // tagged uki-tutor-service-v0.1.2
+const SHA_V013 = 'b2'.repeat(20) // tagged uki-tutor-service-v0.1.3
+const SHA_V020 = 'a1'.repeat(20) // tagged uki-tutor-service-v0.2.0
+const SHA_UNTAGGED_PROD = 'd4'.repeat(20) // no matching release
+const SHA_UNTAGGED_DEV = 'e5'.repeat(20) // no matching release
+
+const RELEASES_3 = [
+  { tag: 'uki-tutor-service-v0.2.0', publishedAt: '2026-08-13T02:46:52Z' },
+  { tag: 'uki-tutor-service-v0.1.3', publishedAt: '2026-08-12T05:10:27Z' },
+  { tag: 'uki-tutor-service-v0.1.2', publishedAt: '2026-08-11T12:59:48Z' },
+]
+
+const TAG_INDEX_3 = new Map([
+  [SHA_V020, 'uki-tutor-service-v0.2.0'],
+  [SHA_V013, 'uki-tutor-service-v0.1.3'],
+  [SHA_V012, 'uki-tutor-service-v0.1.2'],
+])
+
+// --- pickCurrentDeployment -------------------------------------------------
+
+test('pickCurrentDeployment prefers the newest success over an older inactive', () => {
+  const deployments = [
+    { sha: 'newer', state: 'inactive' },
+    { sha: 'newest-success', state: 'success' },
+    { sha: 'oldest', state: 'success' },
+  ]
+  assert.equal(pickCurrentDeployment(deployments)?.sha, 'newest-success')
+})
+
+test('pickCurrentDeployment falls back to the newest inactive when nothing succeeded since', () => {
+  const deployments = [
+    { sha: 'newest-failed', state: 'failure' },
+    { sha: 'last-good', state: 'inactive' },
+  ]
+  assert.equal(pickCurrentDeployment(deployments)?.sha, 'last-good')
+})
+
+test('pickCurrentDeployment returns null for an empty or all-failed list', () => {
+  assert.equal(pickCurrentDeployment([]), null)
+  assert.equal(pickCurrentDeployment([{ sha: 'x', state: 'failure' }]), null)
+})
+
+// --- buildBanner (pure) -----------------------------------------------------
+
+test('buildBanner: tagged prod, differently-tagged dev — dev line shown', () => {
+  const banner = buildBanner({
+    prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
+    dev: { sha: SHA_V020, deployedAt: '2026-08-13T02:47:31Z' },
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined,
+    prodReachable: true,
+  })
+  assert.equal(banner.prod.version, 'uki-tutor-service-v0.1.2')
+  assert.equal(banner.prod.untagged, false)
+  assert.equal(banner.prod.reachable, true)
+  assert.ok(banner.dev, 'dev line should be present when versions differ')
+  assert.equal(banner.dev.version, 'uki-tutor-service-v0.2.0')
+  assert.equal(banner.dev.date, '2026-08-13T02:47:31Z')
+})
+
+test('buildBanner: dev deploys the identical sha as prod — dev line omitted', () => {
+  const banner = buildBanner({
+    prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
+    dev: { sha: SHA_V012, deployedAt: '2026-08-12T00:00:00Z' },
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined,
+    prodReachable: true,
+  })
+  assert.equal(banner.dev, null)
+})
+
+test('buildBanner: prod and dev resolve to the same tag via different shas — dev line omitted', () => {
+  // Contrived (two shas mapped to the same tag) but exercises the "same tag,
+  // different build" branch independently of the "identical sha" branch.
+  const tagIndex = new Map([
+    [SHA_V012, 'uki-tutor-service-v0.1.2'],
+    [SHA_UNTAGGED_DEV, 'uki-tutor-service-v0.1.2'],
+  ])
+  const banner = buildBanner({
+    prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
+    dev: { sha: SHA_UNTAGGED_DEV, deployedAt: '2026-08-12T00:00:00Z' },
+    releases: RELEASES_3,
+    tagIndex,
+    publicUrl: undefined,
+    prodReachable: true,
+  })
+  assert.equal(banner.dev, null)
+})
+
+test('buildBanner: untagged prod build falls back to the newest release at-or-before its deploy date, no sha anywhere', () => {
+  const banner = buildBanner({
+    // Between v0.1.2 (published 12:59:48) and v0.1.3 (published next day).
+    prod: { sha: SHA_UNTAGGED_PROD, deployedAt: '2026-08-11T23:20:00Z' },
+    dev: null,
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined,
+    prodReachable: true,
+  })
+  assert.equal(banner.prod.untagged, true)
+  assert.equal(banner.prod.version, 'uki-tutor-service-v0.1.2')
+  assert.ok(
+    !JSON.stringify(banner).includes(SHA_UNTAGGED_PROD),
+    'the deployed sha must never appear in the banner object handed to render.mjs',
+  )
+})
+
+test('buildBanner: untagged dev that resolves to no newer tag than prod counts as dev == prod', () => {
+  const releasesUpToV013 = RELEASES_3.filter(r => r.tag !== 'uki-tutor-service-v0.2.0')
+  const tagIndex = new Map([[SHA_V013, 'uki-tutor-service-v0.1.3']])
+  const banner = buildBanner({
+    prod: { sha: SHA_V013, deployedAt: '2026-08-12T05:10:27Z' },
+    // Untagged, deployed after prod, but no newer release exists yet.
+    dev: { sha: SHA_UNTAGGED_DEV, deployedAt: '2026-08-12T06:00:00Z' },
+    releases: releasesUpToV013,
+    tagIndex,
+    publicUrl: undefined,
+    prodReachable: true,
+  })
+  assert.equal(banner.dev, null)
+})
+
+test('buildBanner: untagged dev that resolves to a genuinely newer release than prod — dev line shown', () => {
+  const banner = buildBanner({
+    prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
+    // Untagged, deployed after v0.2.0 was published — dev is ahead.
+    dev: { sha: SHA_UNTAGGED_DEV, deployedAt: '2026-08-13T03:00:00Z' },
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined,
+    prodReachable: true,
+  })
+  assert.ok(banner.dev)
+  assert.equal(banner.dev.version, 'uki-tutor-service-v0.2.0')
+})
+
+test('buildBanner: no prod deployment — banner omitted entirely', () => {
+  assert.equal(
+    buildBanner({
+      prod: null,
+      dev: { sha: SHA_V020, deployedAt: '2026-08-13T02:47:31Z' },
+      releases: RELEASES_3,
+      tagIndex: TAG_INDEX_3,
+      publicUrl: undefined,
+      prodReachable: true,
+    }),
+    null,
+  )
+})
+
+test('buildBanner: prod deployment predates every known release — banner omitted entirely', () => {
+  const banner = buildBanner({
+    prod: { sha: SHA_UNTAGGED_PROD, deployedAt: '2020-01-01T00:00:00Z' },
+    dev: null,
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined,
+    prodReachable: true,
+  })
+  assert.equal(banner, null)
+})
+
+test('buildBanner: a non-true probe result (failure, timeout, or missing url) always normalises to reachable: false', () => {
+  const banner = buildBanner({
+    prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
+    dev: null,
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined,
+    prodReachable: undefined,
+  })
+  assert.equal(banner.prod.reachable, false)
+})
+
+// --- probeProd ---------------------------------------------------------------
+
+test('probeProd: no url configured — returns false without attempting a fetch', async () => {
+  let called = false
+  const result = await probeProd(undefined, { fetchFn: async () => { called = true; return { ok: true } } })
+  assert.equal(result, false)
+  assert.equal(called, false)
+})
+
+test('probeProd: reachable — returns true', async () => {
+  const result = await probeProd('https://example.test', { fetchFn: async () => ({ ok: true }) })
+  assert.equal(result, true)
+})
+
+test('probeProd: every attempt fails — retries once, then returns false without throwing', async () => {
+  let calls = 0
+  const fetchFn = async () => { calls++; throw new Error('boom') }
+  const result = await probeProd('https://example.test', { fetchFn, timeoutMs: 10, retries: 1 })
+  assert.equal(result, false)
+  assert.equal(calls, 2, 'initial attempt plus exactly one retry')
+})
+
+test('probeProd: never throws even against a malformed URL', async () => {
+  await assert.doesNotReject(() => probeProd('not a valid url', { retries: 0 }))
+  assert.equal(await probeProd('not a valid url', { retries: 0 }), false)
+})
+
+// --- resolveTagIndex ----------------------------------------------------------
+
+test('resolveTagIndex: a failed lookup for one tag does not lose matches for the others', async () => {
+  const releases = [
+    { tag: 'broken-tag', publishedAt: '2026-08-12T00:00:00Z' },
+    { tag: 'good-tag', publishedAt: '2026-08-11T00:00:00Z' },
+  ]
+  const ghFn = async path => {
+    if (path.includes('broken-tag')) throw new Error('404')
+    return { sha: SHA_V012 }
+  }
+  const index = await resolveTagIndex('owner', 'repo', releases, [SHA_V012], ghFn)
+  assert.equal(index.get(SHA_V012), 'good-tag')
+})
+
+// --- computeServiceBanner (orchestration, network mocked) --------------------
+
+test('computeServiceBanner: deployments fetch failing (e.g. PAT lacks Deployments: Read) degrades to no banner', async () => {
+  const ghFn = async () => { throw new Error('GitHub GET ... -> 403 Forbidden') }
+  const banner = await computeServiceBanner(
+    'UKi-Hub-Center',
+    { name: 'uki-tutor-service' },
+    RELEASES_3,
+    { gh: ghFn },
+  )
+  assert.equal(banner, null)
+})
+
+test('computeServiceBanner: end-to-end happy path resolves probeUrlEnv and produces the expected banner', async () => {
+  process.env.TEST_PHASE_A_PROBE_URL = 'https://internal.example.invalid/health'
+  try {
+    const ghFn = async path => {
+      if (path.includes('/deployments?environment=prod')) {
+        return [{ id: 1, sha: SHA_V012, created_at: '2026-08-11T23:19:51Z' }]
+      }
+      if (path.includes('/deployments?environment=dev')) {
+        return [{ id: 2, sha: SHA_V020, created_at: '2026-08-13T02:47:31Z' }]
+      }
+      if (path.includes('/deployments/1/statuses')) return [{ state: 'success' }]
+      if (path.includes('/deployments/2/statuses')) return [{ state: 'success' }]
+      if (path.includes('uki-tutor-service-v0.2.0')) return { sha: SHA_V020 }
+      if (path.includes('uki-tutor-service-v0.1.3')) return { sha: SHA_V013 }
+      if (path.includes('uki-tutor-service-v0.1.2')) return { sha: SHA_V012 }
+      throw new Error(`unexpected path in test: ${path}`)
+    }
+    let probedUrl = null
+    const probeFn = async url => { probedUrl = url; return true }
+
+    const banner = await computeServiceBanner(
+      'UKi-Hub-Center',
+      { name: 'uki-tutor-service', probeUrlEnv: 'TEST_PHASE_A_PROBE_URL' },
+      RELEASES_3,
+      { gh: ghFn, probeProd: probeFn },
+    )
+
+    assert.equal(probedUrl, 'https://internal.example.invalid/health')
+    assert.equal(banner.prod.version, 'uki-tutor-service-v0.1.2')
+    assert.equal(banner.prod.reachable, true)
+    assert.equal(banner.dev.version, 'uki-tutor-service-v0.2.0')
+  } finally {
+    delete process.env.TEST_PHASE_A_PROBE_URL
+  }
+})
+
+// --- render-level: banner markup and the public/internal boundary ------------
+
+const forbiddenPatterns = {
+  'a run.app hostname': /run\.app/i,
+  'a pages.dev hostname': /pages\.dev/i,
+  // Regex, not a literal — a future change that renders a *different* sha
+  // (not one of the fixture values above) must still fail this check.
+  'a 7- or 40-hex-char commit sha': /\b[0-9a-f]{40}\b|\b[0-9a-f]{7}\b/i,
+  'the Cloud Run URL infix sgwblipyaa': /sgwblipyaa/i,
+  'the Cloud Run URL infix q2omqw3zpa': /q2omqw3zpa/i,
+  'the prod DB instance name': /uki-tutor-db-prod-e448/i,
+  'the dev DB instance name': /uki-tutor-db-dev-80d0/i,
+}
+
+function assertNoForbiddenPatterns(html) {
+  for (const [label, pattern] of Object.entries(forbiddenPatterns)) {
+    assert.ok(!pattern.test(html), `leaked ${label} into rendered output`)
+  }
+}
+
+test('renderPage never leaks deployment/infra detail even when a section carries it as extra fields', () => {
+  const apiBanner = buildBanner({
+    prod: { sha: SHA_UNTAGGED_PROD, deployedAt: '2026-08-11T23:20:00Z' },
+    dev: { sha: SHA_V020, deployedAt: '2026-08-13T02:47:31Z' },
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined, // API section: no URL may ever be shown
+    prodReachable: true,
+  })
+  const spaBanner = buildBanner({
+    prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
+    dev: null,
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: 'uki-tutor.com',
+    prodReachable: false,
+  })
+
+  const html = renderPage({
+    owner: OWNER,
+    generatedAt: '2026-08-13T03:00:00Z',
+    sections: [
+      {
+        // Simulates the real shape gatherReleases would produce via `...repo`
+        // — extra config fields riding along on the section that render.mjs
+        // must never read, carrying exactly the strings the brief forbids.
+        name: 'uki-tutor-service',
+        title: 'API',
+        blurb: 'Go backend',
+        probeUrl: 'https://uki-tutor-api-prod-sgwblipyaa-uc.a.run.app/health',
+        probeUrlEnv: 'UKI_TUTOR_SERVICE_PROBE_URL',
+        db: { instance: 'uki-tutor-db-prod-e448' },
+        devDb: { instance: 'uki-tutor-db-dev-80d0' },
+        devUrl: 'https://uki-tutor-api-dev-q2omqw3zpa-uc.a.run.app/health',
+        deployedSha: SHA_UNTAGGED_PROD,
+        releases: [
+          { tag: 'uki-tutor-service-v0.1.2', name: 'v0.1.2', publishedAt: '2026-08-11T12:59:48Z', html: '<p>notes</p>' },
+        ],
+        banner: apiBanner,
+      },
+      {
+        name: 'uki-tutor-ui',
+        title: 'Web & mobile app',
+        blurb: 'React + Capacitor client',
+        devUrl: 'https://uki-tutor-ui-dev.pages.dev',
+        releases: [
+          { tag: 'uki-tutor-ui-v0.2.1', name: 'v0.2.1', publishedAt: '2026-08-10T16:32:41Z', html: '<p>notes</p>' },
+        ],
+        banner: spaBanner,
+      },
+    ],
+  })
+
+  assertNoForbiddenPatterns(html)
+  assert.ok(!/<(script|link)\b/i.test(html), 'page must stay self-contained even with banners present')
+  // Sanity: the banners actually rendered something, so the clean grep above
+  // is not just an artifact of the banner being empty.
+  assert.ok(html.includes('latest release'), 'untagged prod fallback text should render')
+  assert.ok(html.includes('uki-tutor.com'), 'the SPA public URL should render')
+})
+
+test('banner: API/Admin sections never render a URL of any kind', () => {
+  const banner = buildBanner({
+    prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
+    dev: null,
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined,
+    prodReachable: true,
+  })
+  const html = renderPage({
+    owner: OWNER,
+    generatedAt: '2026-08-13T03:00:00Z',
+    sections: [{ name: 'uki-tutor-service', title: 'API', blurb: 'Go backend', releases: [], banner }],
+  })
+  const bannerMarkup = html.slice(html.indexOf('class="banner"'), html.indexOf('</div>', html.indexOf('class="banner"')))
+  assert.ok(!/https?:\/\//i.test(bannerMarkup), `API banner must not contain a URL: ${bannerMarkup}`)
+  assert.ok(!bannerMarkup.includes('uki-tutor.com'))
+})
+
+test('banner: the SPA section shows its public URL', () => {
+  const banner = buildBanner({
+    prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
+    dev: null,
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: 'uki-tutor.com',
+    prodReachable: true,
+  })
+  const html = renderPage({
+    owner: OWNER,
+    generatedAt: '2026-08-13T03:00:00Z',
+    sections: [{ name: 'uki-tutor-ui', title: 'Web & mobile app', blurb: '', releases: [], banner }],
+  })
+  assert.ok(html.includes('uki-tutor.com'))
+})
+
+test('banner: untagged prod renders "(a newer build is live)" with the fallback version and no sha', () => {
+  const banner = buildBanner({
+    prod: { sha: SHA_UNTAGGED_PROD, deployedAt: '2026-08-11T23:20:00Z' },
+    dev: null,
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined,
+    prodReachable: true,
+  })
+  const html = renderPage({
+    owner: OWNER,
+    generatedAt: '2026-08-13T03:00:00Z',
+    sections: [{ name: 'uki-tutor-service', title: 'API', blurb: '', releases: [], banner }],
+  })
+  assert.ok(html.includes('latest release'))
+  assert.ok(html.includes('(a newer build is live)'))
+  assert.ok(html.includes('uki-tutor-service-v0.1.2'))
+  assert.ok(!/\b[0-9a-f]{40}\b|\b[0-9a-f]{7}\b/i.test(html))
+})
+
+test('banner: probe failure renders an amber "status unknown" dot, never a red error', () => {
+  const banner = buildBanner({
+    prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
+    dev: null,
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined,
+    prodReachable: false,
+  })
+  const html = renderPage({
+    owner: OWNER,
+    generatedAt: '2026-08-13T03:00:00Z',
+    sections: [{ name: 'uki-tutor-service', title: 'API', blurb: '', releases: [], banner }],
+  })
+  const bannerMarkup = html.slice(html.indexOf('<div class="banner"'), html.indexOf('</div>', html.indexOf('<div class="banner"')))
+  assert.ok(bannerMarkup.includes('status unknown'))
+  assert.ok(!bannerMarkup.includes('operational'))
+  assert.ok(!/error/i.test(bannerMarkup))
+  assert.ok(bannerMarkup.includes('dot-unknown'))
+  assert.ok(!bannerMarkup.includes('dot-ok'), `dot-ok class must not appear on an unreachable prod: ${bannerMarkup}`)
+})
+
+test('banner: deployments failure omits the banner but release cards still render', () => {
+  const html = renderPage({
+    owner: OWNER,
+    generatedAt: '2026-08-13T03:00:00Z',
+    sections: [
+      {
+        name: 'uki-tutor-service',
+        title: 'API',
+        blurb: 'Go backend',
+        releases: [
+          { tag: 'uki-tutor-service-v0.1.2', name: 'v0.1.2', publishedAt: '2026-08-11T12:59:48Z', html: '<p>notes</p>' },
+        ],
+        banner: null,
+      },
+    ],
+  })
+  assert.ok(!html.includes('class="banner"'), 'no banner markup should be emitted')
+  assert.ok(!html.includes('live in production'))
+  assert.ok(html.includes('uki-tutor-service-v0.1.2'), 'release cards must still render')
+  assert.ok(html.includes('<p>notes</p>'))
+})
+
+test('banner: dev == prod renders only the prod line, no "next up"', () => {
+  const banner = buildBanner({
+    prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
+    dev: { sha: SHA_V012, deployedAt: '2026-08-12T00:00:00Z' },
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined,
+    prodReachable: true,
+  })
+  const html = renderPage({
+    owner: OWNER,
+    generatedAt: '2026-08-13T03:00:00Z',
+    sections: [{ name: 'uki-tutor-service', title: 'API', blurb: '', releases: [], banner }],
+  })
+  assert.ok(html.includes('live in production'))
+  assert.ok(!html.includes('next up'))
+})
+
+test('banner: dev != prod renders the "next up" dev line with its own version and date', () => {
+  const banner = buildBanner({
+    prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
+    dev: { sha: SHA_V020, deployedAt: '2026-08-13T02:47:31Z' },
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined,
+    prodReachable: true,
+  })
+  const html = renderPage({
+    owner: OWNER,
+    generatedAt: '2026-08-13T03:00:00Z',
+    sections: [{ name: 'uki-tutor-service', title: 'API', blurb: '', releases: [], banner }],
+  })
+  assert.ok(html.includes('next up'))
+  assert.ok(html.includes('uki-tutor-service-v0.2.0'))
+  assert.ok(html.includes('13 Aug 2026'))
 })

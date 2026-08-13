@@ -39,6 +39,8 @@ const STYLE = `
   --muted: #6b6b66;
   --accent: #1f6f5c;
   --tag-bg: #e9f2ef;
+  --status-ok: #2f9e63;
+  --status-unknown: #c8932d;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -49,6 +51,8 @@ const STYLE = `
     --muted: #9aa19d;
     --accent: #6ee7c9;
     --tag-bg: #1d2b27;
+    --status-ok: #4fd68b;
+    --status-unknown: #e0ac4c;
   }
 }
 * { box-sizing: border-box; }
@@ -89,6 +93,27 @@ article.release > h3 { margin: 0; font-size: 1rem; display: flex; align-items: b
 .notes code { font-size: .85em; background: var(--tag-bg); padding: .1rem .3rem; border-radius: .25rem; }
 .notes pre { overflow-x: auto; }
 .empty { color: var(--muted); font-style: italic; font-size: .92rem; }
+.banner {
+  border: 1px solid var(--border);
+  border-radius: .7rem;
+  padding: .75rem 1rem;
+  margin-bottom: 1rem;
+  background: var(--tag-bg);
+  font-size: .88rem;
+}
+.banner p { margin: 0; }
+.banner p + p { margin-top: .3rem; }
+.banner .dot {
+  display: inline-block;
+  width: .55rem;
+  height: .55rem;
+  border-radius: 50%;
+  margin-right: .3rem;
+  background: var(--status-unknown);
+}
+.banner .dot-ok { background: var(--status-ok); }
+.banner .banner-dev { color: var(--muted); }
+.banner a { color: var(--accent); }
 footer { border-top: 1px solid var(--border); padding-top: 1.25rem; color: var(--muted); font-size: .82rem; }
 `
 
@@ -101,14 +126,46 @@ function renderRelease(release) {
       </article>`
 }
 
+/**
+ * The "now live" banner. `section.banner` is the shape produced by
+ * fetch.mjs's buildBanner — it carries only a resolved version, a date, and
+ * a reachable boolean, never a sha or any deployment URL. Whether a URL may
+ * be shown at all is decided upstream, in repos.json/computeServiceBanner
+ * (only the SPA entry sets `publicUrl`) — this function never has an
+ * internal URL available to render even by mistake, and it makes that
+ * decision by presence of `publicUrl`, not by section identity.
+ */
+function renderBanner(banner) {
+  if (!banner || !banner.prod) return ''
+
+  const { prod, dev, publicUrl } = banner
+  const dotClass = prod.reachable ? 'dot-ok' : 'dot-unknown'
+  const statusText = prod.reachable ? 'operational' : 'status unknown'
+  const prodLabel = prod.untagged
+    ? `latest release <strong>${escapeHtml(prod.version)}</strong> (a newer build is live)`
+    : `<strong>${escapeHtml(prod.version)}</strong>`
+  const urlSuffix = publicUrl
+    ? ` — <a href="https://${escapeHtml(publicUrl)}">${escapeHtml(publicUrl)}</a>`
+    : ''
+  const devLine = dev
+    ? `\n      <p class="banner-dev">next up: <strong>${escapeHtml(dev.version)}</strong> on dev since ${escapeHtml(formatDate(dev.date))}</p>`
+    : ''
+
+  return `    <div class="banner">
+      <p class="banner-prod"><span class="dot ${dotClass}" aria-hidden="true"></span>${prodLabel} live in production since ${escapeHtml(formatDate(prod.date))} &middot; ${statusText}${urlSuffix}</p>${devLine}
+    </div>
+`
+}
+
 function renderSection(section) {
+  const bannerHtml = renderBanner(section.banner)
   const body = section.releases.length
     ? section.releases.map(renderRelease).join('\n')
     : '      <p class="empty">No releases published yet.</p>'
   return `    <section class="repo">
       <h2>${escapeHtml(section.title)}</h2>
       <p class="blurb">${escapeHtml(section.blurb)}</p>
-${body}
+${bannerHtml}${body}
     </section>`
 }
 
