@@ -1,3 +1,9 @@
 # Build output — regenerated on every publish.
 site/
 .idea
+
+# Local git worktrees
+.worktrees/
+
+# SDD scratch
+.superpowers/
