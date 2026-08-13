@@ -107,7 +107,17 @@ export async function gatherReleases(config) {
       })
     }
 
-    const banner = await computeServiceBanner(owner, repo, releases)
+    // I1: buildBanner can throw on an unexpected shape or malformed date, and
+    // computeServiceBanner is supposed to degrade every such failure to null
+    // itself — but a bug there must still never take down the whole publish,
+    // so this is defense in depth, not the primary guard.
+    let banner
+    try {
+      banner = await computeServiceBanner(owner, repo, releases)
+    } catch (err) {
+      console.log(`  ${repo.name}: banner computation failed unexpectedly (${err.message}) — omitting "now live" banner`)
+      banner = null
+    }
     sections.push(toPublicSection(repo, releases, banner))
     console.log(`  ${repo.name}: ${releases.length} release(s)`)
   }
@@ -354,12 +364,20 @@ export async function computeServiceBanner(owner, repo, releases, deps = {}) {
   // null, not false: false means "probed and did not answer".
   const prodReachable = probeConfigured ? await probeFn(probeUrl) : null
 
-  return buildBanner({
-    prod: deployments.prod,
-    dev: deployments.dev,
-    releases,
-    tagIndex,
-    publicUrl: repo.publicUrl,
-    prodReachable,
-  })
+  // I1: buildBanner is pure but not infallible — an unexpected shape or a
+  // malformed date can throw, and that must degrade this one banner, not
+  // fail the whole build (unconditional per the spec's degradation rule).
+  try {
+    return buildBanner({
+      prod: deployments.prod,
+      dev: deployments.dev,
+      releases,
+      tagIndex,
+      publicUrl: repo.publicUrl,
+      prodReachable,
+    })
+  } catch (err) {
+    console.log(`  ${repo.name}: banner assembly failed (${err.message}) — omitting "now live" banner`)
+    return null
+  }
 }

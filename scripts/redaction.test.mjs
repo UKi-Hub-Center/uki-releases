@@ -404,6 +404,43 @@ test('computeServiceBanner: deployments fetch failing (e.g. PAT lacks Deployment
   assert.equal(banner, null)
 })
 
+// I1 — buildBanner is pure but not infallible, and it used to be the one
+// call in computeServiceBanner that wasn't wrapped: an unexpected shape or a
+// malformed date could throw straight out of build.mjs and fail the whole
+// publish instead of degrading just this one banner.
+test('I1: buildBanner throws on a malformed releases shape (sanity — this is why the wrap exists)', () => {
+  assert.throws(() =>
+    buildBanner({
+      prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
+      dev: null,
+      releases: null, // malformed: resolveEnvEntry calls releases.find(...)
+      tagIndex: TAG_INDEX_3,
+      publicUrl: undefined,
+      prodReachable: true,
+    }),
+  )
+})
+
+test('I1: computeServiceBanner degrades to no banner when buildBanner throws, instead of failing the build', async () => {
+  const ghFn = async path => {
+    if (path.includes('/deployments?environment=prod')) {
+      return [{ id: 1, sha: SHA_V012, created_at: '2026-08-11T23:19:51Z' }]
+    }
+    if (path.includes('/deployments?environment=dev')) return []
+    if (path.includes('/deployments/1/statuses')) return [{ state: 'success' }]
+    return []
+  }
+  // releases: null passes straight through resolveTagIndex (Array.isArray
+  // guard makes it a no-op) and reaches buildBanner, where it throws.
+  const banner = await computeServiceBanner(
+    'UKi-Hub-Center',
+    { name: 'uki-tutor-service' },
+    null,
+    { gh: ghFn },
+  )
+  assert.equal(banner, null)
+})
+
 test('computeServiceBanner: end-to-end happy path resolves probeUrlEnv and produces the expected banner', async () => {
   process.env.TEST_PHASE_A_PROBE_URL = 'https://internal.example.invalid/health'
   try {
@@ -788,6 +825,15 @@ test('a configured probe that fails still renders "status unknown"', () => {
   assert.ok(html.includes('status unknown'), 'a failed probe is surfaced, not hidden')
   assert.ok(/dot-unknown/.test(html), 'and carries the amber dot')
 })
+
+// ---------------------------------------------------------------------------
+// C1 — site/releases.json (JSON.stringify(data), published verbatim by
+// build.mjs) must never carry probeUrl/probeUrlEnv. Confirmed in the real
+// output before this fix: site/releases.json contained
+// "probeUrl": "https://uki-tutor.com" and
+// "probeUrlEnv": "UKI_TUTOR_SERVICE_PROBE_URL" — benign today, but one
+// contributor pasting a Cloud Run URL into probeUrl would leak it into both
+// the published JSON and this public repo's permanent git history.
 
 test('C1: toPublicSection strips probeUrl/probeUrlEnv before the section reaches render.mjs or releases.json', () => {
   const repo = {
