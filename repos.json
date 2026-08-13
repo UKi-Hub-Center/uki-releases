@@ -18,8 +18,7 @@
     {
       "name": "uki-admin-service",
       "title": "Admin",
-      "blurb": "Go backend + admin panel",
-      "probeUrlEnv": "UKI_ADMIN_SERVICE_PROBE_URL"
+      "blurb": "Go backend + admin panel"
     }
   ]
 }

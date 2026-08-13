@@ -264,16 +264,26 @@ test('buildBanner: prod deployment predates every known release — banner omitt
   assert.equal(banner, null)
 })
 
-test('buildBanner: a non-true probe result (failure, timeout, or missing url) always normalises to reachable: false', () => {
-  const banner = buildBanner({
+test('buildBanner: a failed probe normalises to reachable: false, an absent one to null', () => {
+  const base = {
     prod: { sha: SHA_V012, deployedAt: '2026-08-11T23:19:51Z' },
     dev: null,
     releases: RELEASES_3,
     tagIndex: TAG_INDEX_3,
     publicUrl: undefined,
-    prodReachable: undefined,
-  })
-  assert.equal(banner.prod.reachable, false)
+  }
+
+  // Probed and did not answer — the page says so.
+  assert.equal(buildBanner({ ...base, prodReachable: false }).prod.reachable, false)
+
+  // Never probed (no probe configured for this service) — the page says
+  // nothing, which is different from saying "unknown". Keeping these two
+  // apart is the whole point: an unprobed service must not look degraded.
+  assert.equal(buildBanner({ ...base, prodReachable: null }).prod.reachable, null)
+  assert.equal(buildBanner({ ...base, prodReachable: undefined }).prod.reachable, null)
+
+  // Anything else truthy-but-not-true is still not a success claim.
+  assert.equal(buildBanner({ ...base, prodReachable: 'yes' }).prod.reachable, false)
 })
 
 // --- probeProd ---------------------------------------------------------------
@@ -583,4 +593,65 @@ test('banner: dev != prod renders the "next up" dev line with its own version an
   assert.ok(html.includes('next up'))
   assert.ok(html.includes('uki-tutor-service-v0.2.0'))
   assert.ok(html.includes('13 Aug 2026'))
+})
+
+// ---- status is three-state, not two -----------------------------------------
+// A repo with no probe configured (the admin panel) carries no status on this
+// page at all: no dot, no text. A repo that *is* configured but whose URL did
+// not arrive still says "status unknown", because that is a misconfiguration
+// and hiding it would make the page quietly less truthful.
+
+test('a service with no probe configured renders no dot and no status text', async () => {
+  const banner = await computeServiceBanner(
+    OWNER,
+    { name: 'uki-admin-service', title: 'Admin', blurb: 'Go backend' },
+    [{ tag: 'v0.1.1', publishedAt: '2026-08-12T00:00:00Z' }],
+    {
+      gh: async path => {
+        if (path.includes('/deployments?')) {
+          return path.includes('prod')
+            ? [{ id: 1, sha: 'aaa1111', created_at: '2026-08-13T00:00:00Z' }]
+            : []
+        }
+        if (path.includes('/statuses')) return [{ state: 'success' }]
+        if (path.includes('/commits/')) return { sha: 'aaa1111' }
+        return []
+      },
+      probeProd: async () => {
+        throw new Error('must not probe a service with no probe configured')
+      },
+    },
+  )
+  assert.equal(banner.prod.reachable, null, 'unprobed reads as null, not false')
+
+  const html = renderPage({
+    owner: OWNER,
+    generatedAt: '2026-08-13T00:00:00Z',
+    sections: [{ name: 'uki-admin-service', title: 'Admin', blurb: 'b', releases: [], banner }],
+  })
+  assert.ok(!html.includes('status unknown'), 'no amber "unknown" for an unprobed service')
+  assert.ok(!html.includes('operational'), 'and no green claim either')
+  assert.ok(!/<span class="dot/.test(html), 'no status dot at all')
+  assert.ok(html.includes('live in production since'), 'the version line still renders')
+})
+
+test('a configured probe that fails still renders "status unknown"', () => {
+  const html = renderPage({
+    owner: OWNER,
+    generatedAt: '2026-08-13T00:00:00Z',
+    sections: [
+      {
+        name: 'uki-tutor-service',
+        title: 'API',
+        blurb: 'b',
+        releases: [],
+        banner: {
+          prod: { version: 'v1', untagged: false, date: '2026-08-13T00:00:00Z', reachable: false },
+          dev: null,
+        },
+      },
+    ],
+  })
+  assert.ok(html.includes('status unknown'), 'a failed probe is surfaced, not hidden')
+  assert.ok(/dot-unknown/.test(html), 'and carries the amber dot')
 })

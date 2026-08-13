@@ -272,7 +272,9 @@ export function buildBanner({ prod, dev, releases, tagIndex, publicUrl, prodReac
       version: prodEntry.tag,
       untagged: prodEntry.untagged,
       date: prod.deployedAt,
-      reachable: prodReachable === true,
+      // true = probed and answered · false = probed and did not · null = not
+      // probed at all, so the renderer shows no status segment.
+      reachable: prodReachable === null || prodReachable === undefined ? null : prodReachable === true,
     },
     dev: devEqualsProd ? null : { version: devEntry.tag, date: dev.deployedAt },
     publicUrl,
@@ -288,6 +290,13 @@ export function buildBanner({ prod, dev, releases, tagIndex, publicUrl, prodReac
 export async function computeServiceBanner(owner, repo, releases, deps = {}) {
   const ghFn = deps.gh ?? gh
   const probeFn = deps.probeProd ?? probeProd
+  // Three distinct states, not two. A repo with no probe configured at all
+  // shows no status segment — the admin panel is internal, and telling the
+  // public when it is up serves no reader of this page. A repo that *is*
+  // configured but whose URL did not arrive (an unset secret) still renders
+  // "status unknown", because that is a misconfiguration and hiding it would
+  // make the page quietly less truthful.
+  const probeConfigured = Boolean(repo.probeUrl || repo.probeUrlEnv)
   const probeUrl = repo.probeUrl ?? (repo.probeUrlEnv ? process.env[repo.probeUrlEnv] : undefined)
 
   let deployments
@@ -307,7 +316,8 @@ export async function computeServiceBanner(owner, repo, releases, deps = {}) {
     return null
   }
 
-  const prodReachable = await probeFn(probeUrl)
+  // null, not false: false means "probed and did not answer".
+  const prodReachable = probeConfigured ? await probeFn(probeUrl) : null
 
   return buildBanner({
     prod: deployments.prod,

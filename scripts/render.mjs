@@ -139,6 +139,10 @@ function renderBanner(banner) {
   if (!banner || !banner.prod) return ''
 
   const { prod, dev, publicUrl } = banner
+  // `reachable === null` means the service was never probed — it carries no
+  // status on this page at all, so it gets no dot and no status text rather
+  // than an amber "unknown" that would imply something is wrong.
+  const probed = prod.reachable !== null && prod.reachable !== undefined
   const dotClass = prod.reachable ? 'dot-ok' : 'dot-unknown'
   const statusText = prod.reachable ? 'operational' : 'status unknown'
   const prodLabel = prod.untagged
@@ -151,8 +155,11 @@ function renderBanner(banner) {
     ? `\n      <p class="banner-dev">next up: <strong>${escapeHtml(dev.version)}</strong> on dev since ${escapeHtml(formatDate(dev.date))}</p>`
     : ''
 
+  const dot = probed ? `<span class="dot ${dotClass}" aria-hidden="true"></span>` : ''
+  const status = probed ? ` &middot; ${statusText}` : ''
+
   return `    <div class="banner">
-      <p class="banner-prod"><span class="dot ${dotClass}" aria-hidden="true"></span>${prodLabel} live in production since ${escapeHtml(formatDate(prod.date))} &middot; ${statusText}${urlSuffix}</p>${devLine}
+      <p class="banner-prod">${dot}${prodLabel} live in production since ${escapeHtml(formatDate(prod.date))}${status}${urlSuffix}</p>${devLine}
     </div>
 `
 }
