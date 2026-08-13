@@ -442,21 +442,46 @@ test('computeServiceBanner: end-to-end happy path resolves probeUrlEnv and produ
 
 // --- render-level: banner markup and the public/internal boundary ------------
 
+// C2 — this deliberately does NOT include a sha pattern. 69 distinct 7-hex
+// commit shas appear on the real page today, inside release-note bodies —
+// that is pre-existing, approved behaviour: stripPrivateLinks demotes
+// `[058d379](…/commit/058d379)` to the bare text `058d379` rather than
+// stripping it (see "the sha text should remain" above and the invariant in
+// CLAUDE.md), because the sha itself is a legitimate reference even though
+// the link it lived in is not. Applying a page-wide sha check here would
+// either always fail (correctly, on real content) or — as it did before this
+// fix — pass for the wrong reason, because every fixture's release `html`
+// happened to be sha-free. The sha check belongs on the banner region only
+// (SHA_PATTERN / assertBannerHasNoShas below), because deployment shas are
+// new-in-Phase-A data that must never reach render.mjs's output at all.
 const forbiddenPatterns = {
   'a run.app hostname': /run\.app/i,
   'a pages.dev hostname': /pages\.dev/i,
-  // Regex, not a literal — a future change that renders a *different* sha
-  // (not one of the fixture values above) must still fail this check.
-  'a 7- or 40-hex-char commit sha': /\b[0-9a-f]{40}\b|\b[0-9a-f]{7}\b/i,
   'the Cloud Run URL infix sgwblipyaa': /sgwblipyaa/i,
   'the Cloud Run URL infix q2omqw3zpa': /q2omqw3zpa/i,
   'the prod DB instance name': /uki-tutor-db-prod-e448/i,
   'the dev DB instance name': /uki-tutor-db-dev-80d0/i,
 }
 
-function assertNoForbiddenPatterns(html) {
-  for (const [label, pattern] of Object.entries(forbiddenPatterns)) {
+function assertNoForbiddenPatterns(html, patterns = forbiddenPatterns) {
+  for (const [label, pattern] of Object.entries(patterns)) {
     assert.ok(!pattern.test(html), `leaked ${label} into rendered output`)
+  }
+}
+
+// Regex, not a literal — a future change that renders a *different* sha (not
+// one of the fixture values used elsewhere in this file) must still fail
+// this check. Deliberately narrower in scope than forbiddenPatterns above:
+// applied to banner markup only, never to the page as a whole.
+const SHA_PATTERN = /\b[0-9a-f]{40}\b|\b[0-9a-f]{7}\b/i
+
+function bannerBlocks(html) {
+  return html.match(/<div class="banner">[\s\S]*?<\/div>/g) ?? []
+}
+
+function assertBannerHasNoShas(html) {
+  for (const block of bannerBlocks(html)) {
+    assert.ok(!SHA_PATTERN.test(block), `a commit sha leaked into a banner region: ${block}`)
   }
 }
 
@@ -514,11 +539,56 @@ test('renderPage never leaks deployment/infra detail even when a section carries
   })
 
   assertNoForbiddenPatterns(html)
+  assertBannerHasNoShas(html)
   assert.ok(!/<(script|link)\b/i.test(html), 'page must stay self-contained even with banners present')
   // Sanity: the banners actually rendered something, so the clean grep above
   // is not just an artifact of the banner being empty.
   assert.ok(html.includes('latest release'), 'untagged prod fallback text should render')
   assert.ok(html.includes('uki-tutor.com'), 'the SPA public URL should render')
+})
+
+// C2 — regression guard: proves the split assertion is honest. Before this
+// fix, the sha pattern was checked page-wide but every test supplying it
+// used trivial release `html` fixtures, so the check passed vacuously and
+// never actually exercised the one thing that matters: that a *deployment*
+// sha (new-in-Phase-A data) never reaches the banner, while a *release-note*
+// sha (pre-existing, approved — see stripPrivateLinks) is free to survive
+// anywhere else on the page.
+test('C2: a release-note sha survives on the page while the banner region stays provably sha-free', () => {
+  const noteSha = '058d379'
+  const releaseHtml =
+    `<ul><li><strong>profile:</strong> release the certificate blob when its tab closes (${noteSha})</li></ul>`
+
+  // Untagged prod/dev, both resolved via a sha that must never itself reach
+  // the rendered banner — buildBanner's contract, exercised here end to end.
+  const banner = buildBanner({
+    prod: { sha: SHA_UNTAGGED_PROD, deployedAt: '2026-08-11T23:20:00Z' },
+    dev: { sha: SHA_UNTAGGED_DEV, deployedAt: '2026-08-13T02:47:31Z' },
+    releases: RELEASES_3,
+    tagIndex: TAG_INDEX_3,
+    publicUrl: undefined,
+    prodReachable: true,
+  })
+
+  const html = renderPage({
+    owner: OWNER,
+    generatedAt: '2026-08-13T03:00:00Z',
+    sections: [
+      {
+        name: 'uki-tutor-ui',
+        title: 'Web & mobile app',
+        blurb: 'React + Capacitor client',
+        releases: [
+          { tag: 'uki-tutor-ui-v0.1.0', name: 'v0.1.0', publishedAt: '2026-08-10T02:06:55Z', html: releaseHtml },
+        ],
+        banner,
+      },
+    ],
+  })
+
+  assert.ok(html.includes(noteSha), 'the release-note sha is a deliberate, approved exception and must survive')
+  assert.ok(bannerBlocks(html).length > 0, 'sanity: a banner actually rendered')
+  assertBannerHasNoShas(html)
 })
 
 test('banner: API/Admin sections never render a URL of any kind', () => {
