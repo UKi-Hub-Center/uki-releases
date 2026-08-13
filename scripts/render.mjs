@@ -112,6 +112,7 @@ article.release > h3 { margin: 0; font-size: 1rem; display: flex; align-items: b
   background: var(--status-unknown);
 }
 .banner .dot-ok { background: var(--status-ok); }
+.banner .dot-unknown { background: var(--status-unknown); }
 .banner .banner-dev { color: var(--muted); }
 .banner a { color: var(--accent); }
 footer { border-top: 1px solid var(--border); padding-top: 1.25rem; color: var(--muted); font-size: .82rem; }
