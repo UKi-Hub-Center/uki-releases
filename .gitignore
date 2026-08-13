@@ -1,2 +1,3 @@
 # Build output — regenerated on every publish.
 site/
+.idea
