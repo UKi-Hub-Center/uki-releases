@@ -315,7 +315,7 @@ test('probeProd: never throws even against a malformed URL', async () => {
 
 // --- resolveTagIndex ----------------------------------------------------------
 
-test('resolveTagIndex: a failed lookup for one tag does not lose matches for the others', async () => {
+test('resolveTagIndex: a failed lookup for one tag does not lose matches for the others, but is still reported', async () => {
   const releases = [
     { tag: 'broken-tag', publishedAt: '2026-08-12T00:00:00Z' },
     { tag: 'good-tag', publishedAt: '2026-08-11T00:00:00Z' },
@@ -324,8 +324,68 @@ test('resolveTagIndex: a failed lookup for one tag does not lose matches for the
     if (path.includes('broken-tag')) throw new Error('404')
     return { sha: SHA_V012 }
   }
-  const index = await resolveTagIndex('owner', 'repo', releases, [SHA_V012], ghFn)
+  const { index, failed } = await resolveTagIndex('owner', 'repo', releases, [SHA_V012], ghFn)
   assert.equal(index.get(SHA_V012), 'good-tag')
+  // C3: the match still resolved, but the caller must still be told a lookup
+  // failed — it cannot tell "resolved" apart from "one failure happened to
+  // not matter this time" without this count.
+  assert.equal(failed, 1)
+})
+
+test('resolveTagIndex: no failures reports failed: 0', async () => {
+  const releases = [{ tag: 'good-tag', publishedAt: '2026-08-11T00:00:00Z' }]
+  const ghFn = async () => ({ sha: SHA_V012 })
+  const { index, failed } = await resolveTagIndex('owner', 'repo', releases, [SHA_V012], ghFn)
+  assert.equal(index.get(SHA_V012), 'good-tag')
+  assert.equal(failed, 0)
+})
+
+// C3 — regression guard: a failed tag lookup must never make the page assert
+// something false. Before this fix, resolveTagIndex swallowed every
+// per-release lookup error into `sha = null`, so a transient 403 made every
+// deployed sha "resolve" as untagged — and the page then claimed "a newer
+// build is live" for a service that was, in fact, running exactly the
+// tagged release the lookup failed to recognise. The fix must make this
+// indistinguishable, at the call site, from any other degradation: no
+// banner, release notes still render.
+test('C3: a 403 on one release-tag lookup omits the banner rather than rendering a false "newer build" claim', async () => {
+  const ghFn = async path => {
+    if (path.includes('/deployments?environment=prod')) {
+      return [{ id: 1, sha: SHA_V012, created_at: '2026-08-11T23:19:51Z' }]
+    }
+    if (path.includes('/deployments?environment=dev')) return []
+    if (path.includes('/deployments/1/statuses')) return [{ state: 'success' }]
+    // Every tag lookup 403s — the real failure mode from tonight's rate limit.
+    if (path.includes('/commits/')) throw new Error('GitHub GET ... -> 403 Forbidden')
+    throw new Error(`unexpected path in test: ${path}`)
+  }
+
+  const banner = await computeServiceBanner(
+    'UKi-Hub-Center',
+    { name: 'uki-tutor-service' },
+    RELEASES_3,
+    { gh: ghFn },
+  )
+  assert.equal(banner, null, 'a failed tag lookup must omit the banner, not render an untagged guess')
+
+  const html = renderPage({
+    owner: OWNER,
+    generatedAt: '2026-08-13T03:00:00Z',
+    sections: [
+      {
+        name: 'uki-tutor-service',
+        title: 'API',
+        blurb: 'Go backend',
+        releases: [
+          { tag: 'uki-tutor-service-v0.1.2', name: 'v0.1.2', publishedAt: '2026-08-11T12:59:48Z', html: '<p>notes</p>' },
+        ],
+        banner,
+      },
+    ],
+  })
+  assert.ok(!html.includes('class="banner"'), 'no banner markup should be emitted')
+  assert.ok(!html.includes('a newer build is live'), 'must never assert a false "newer build" claim')
+  assert.ok(html.includes('uki-tutor-service-v0.1.2'), 'release cards must still render')
 })
 
 // --- computeServiceBanner (orchestration, network mocked) --------------------

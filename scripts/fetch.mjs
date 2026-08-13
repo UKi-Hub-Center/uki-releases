@@ -195,11 +195,20 @@ export async function probeProd(url, { timeoutMs = 2000, retries = 1, fetchFn = 
  * newest-first and stops once every sha in `shas` has been matched (or the
  * list runs out) rather than resolving all of them — most builds are a
  * handful of releases behind, not ten.
+ *
+ * Returns `{ index, failed }` rather than a bare Map (C3): a per-release
+ * lookup failure (a transient 403, a rate limit) must never be swallowed
+ * into "this release is untagged" — that reads to computeServiceBanner as a
+ * confident, false "a newer build is live" claim instead of what it actually
+ * is, a lookup that never happened. `failed` is the count of lookups that
+ * errored; callers must treat any nonzero count as "the index is
+ * incomplete, do not trust it" and degrade, exactly like a thrown error.
  */
 export async function resolveTagIndex(owner, repo, releases, shas, ghFn = gh) {
   const remaining = new Set(shas.filter(Boolean))
   const index = new Map()
-  if (remaining.size === 0 || !Array.isArray(releases)) return index
+  let failed = 0
+  if (remaining.size === 0 || !Array.isArray(releases)) return { index, failed }
 
   for (const release of releases) {
     if (remaining.size === 0) break
@@ -208,14 +217,15 @@ export async function resolveTagIndex(owner, repo, releases, shas, ghFn = gh) {
       const commit = await ghFn(`/repos/${owner}/${repo}/commits/${encodeURIComponent(release.tag)}`)
       sha = commit?.sha ?? null
     } catch {
-      sha = null
+      failed++
+      continue
     }
     if (sha && !index.has(sha)) {
       index.set(sha, release.tag)
       remaining.delete(sha)
     }
   }
-  return index
+  return { index, failed }
 }
 
 /**
@@ -310,7 +320,19 @@ export async function computeServiceBanner(owner, repo, releases, deps = {}) {
   const shas = [deployments.prod?.sha, deployments.dev?.sha].filter(Boolean)
   let tagIndex
   try {
-    tagIndex = await resolveTagIndex(owner, repo.name, releases, shas, ghFn)
+    const result = await resolveTagIndex(owner, repo.name, releases, shas, ghFn)
+    // C3: any failed per-release lookup means the index cannot be trusted —
+    // treat it exactly like the deployments-failure path above, not like a
+    // legitimately-untagged build. The alternative is a page that asserts a
+    // release is "a newer build" when the tagged release it failed to
+    // recognise is precisely what is running.
+    if (result.failed > 0) {
+      console.log(
+        `  ${repo.name}: ${result.failed} release-tag lookup(s) failed — omitting "now live" banner`,
+      )
+      return null
+    }
+    tagIndex = result.index
   } catch (err) {
     console.log(`  ${repo.name}: release-tag lookup failed (${err.message}) — omitting "now live" banner`)
     return null
