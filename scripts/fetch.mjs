@@ -108,11 +108,24 @@ export async function gatherReleases(config) {
     }
 
     const banner = await computeServiceBanner(owner, repo, releases)
-    sections.push({ ...repo, releases, banner })
+    sections.push(toPublicSection(repo, releases, banner))
     console.log(`  ${repo.name}: ${releases.length} release(s)`)
   }
 
   return { owner, sections, generatedAt: new Date().toISOString() }
+}
+
+/**
+ * Shapes the object render.mjs consumes and build.mjs publishes verbatim as
+ * site/releases.json — a raw `repos.json` entry is not safe to publish as-is,
+ * since `probeUrl`/`probeUrlEnv` describe internal probe configuration (a
+ * Cloud Run URL, or the name of the env var that holds one). Strip both at
+ * this boundary so neither can reach the published artifact or this public
+ * repo's permanent git history, no matter what else lands in repos.json later.
+ */
+export function toPublicSection(repo, releases, banner) {
+  const { probeUrl, probeUrlEnv, ...publicRepo } = repo
+  return { ...publicRepo, releases, banner }
 }
 
 // ---------------------------------------------------------------------------

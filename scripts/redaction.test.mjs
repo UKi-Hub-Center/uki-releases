@@ -6,6 +6,7 @@
 // every visitor. Uses node:test so this stays dependency-free.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import {
   stripPrivateLinks,
   pickCurrentDeployment,
@@ -14,6 +15,8 @@ import {
   resolveTagIndex,
   buildBanner,
   computeServiceBanner,
+  toPublicSection,
+  gatherReleases,
 } from './fetch.mjs'
 import { escapeHtml, renderPage } from './render.mjs'
 
@@ -714,4 +717,86 @@ test('a configured probe that fails still renders "status unknown"', () => {
   })
   assert.ok(html.includes('status unknown'), 'a failed probe is surfaced, not hidden')
   assert.ok(/dot-unknown/.test(html), 'and carries the amber dot')
+})
+
+test('C1: toPublicSection strips probeUrl/probeUrlEnv before the section reaches render.mjs or releases.json', () => {
+  const repo = {
+    name: 'uki-tutor-service',
+    title: 'API',
+    blurb: 'Go backend',
+    probeUrl: 'https://uki-tutor-api-prod-sgwblipyaa-uc.a.run.app/health',
+    probeUrlEnv: 'UKI_TUTOR_SERVICE_PROBE_URL',
+  }
+  const section = toPublicSection(repo, [], null)
+
+  assert.ok(!('probeUrl' in section), 'probeUrl key must not survive into the published section')
+  assert.ok(!('probeUrlEnv' in section), 'probeUrlEnv key must not survive into the published section')
+  assert.equal(section.title, 'API', 'unrelated public fields must still pass through')
+
+  // This is what build.mjs actually writes to site/releases.json.
+  const published = JSON.stringify({ owner: OWNER, sections: [section], generatedAt: '2026-08-13T00:00:00Z' })
+  assertNoForbiddenPatterns(published)
+  assert.ok(!published.includes('probeUrl'), 'probeUrl/probeUrlEnv keys must not appear in the published JSON at all')
+  assert.ok(!published.includes('sgwblipyaa'), 'the Cloud Run URL that was in probeUrl must not leak into releases.json')
+})
+
+test('C1: gatherReleases never republishes probeUrl/probeUrlEnv (network stubbed — guards the real wiring, not just the helper)', async () => {
+  // toPublicSection is correct in isolation but gatherReleases has to
+  // actually call it; this exercises the real call site with global fetch
+  // stubbed, so a future revert to `{ ...repo, releases, banner }` would be
+  // caught here even if toPublicSection itself were untouched.
+  const originalFetch = global.fetch
+  const hadToken = 'GH_TOKEN' in process.env
+  const priorToken = process.env.GH_TOKEN
+  process.env.GH_TOKEN = 'test-token'
+
+  const jsonResponse = body => ({ ok: true, status: 200, statusText: 'OK', json: async () => body, text: async () => JSON.stringify(body) })
+
+  global.fetch = async url => {
+    const u = String(url)
+    if (u.includes('/releases?')) return jsonResponse([])
+    if (u.includes('/deployments?')) return jsonResponse([])
+    if (u === 'https://internal.example.invalid/probe') return { ok: true }
+    throw new Error(`unexpected fetch in test: ${u}`)
+  }
+
+  try {
+    const data = await gatherReleases({
+      owner: OWNER,
+      maxReleasesPerRepo: 1,
+      repos: [
+        {
+          name: 'uki-tutor-service',
+          title: 'API',
+          blurb: 'Go backend',
+          probeUrl: 'https://internal.example.invalid/probe',
+          probeUrlEnv: 'SOME_ENV_VAR',
+        },
+      ],
+    })
+    const published = JSON.stringify(data)
+    assert.ok(!published.includes('probeUrl'), 'probeUrl must not survive gatherReleases into the published data')
+    assert.ok(!published.includes('internal.example.invalid'), 'the probe URL value must not leak either')
+  } finally {
+    global.fetch = originalFetch
+    if (hadToken) process.env.GH_TOKEN = priorToken
+    else delete process.env.GH_TOKEN
+  }
+})
+
+test('C1: repos.json on disk contains no internal hostname and no https:// URL other than uki-tutor.com', () => {
+  // This is the gate that converts the probeUrlEnv indirection from a
+  // convention into something enforced: it fails if anyone commits an
+  // internal address (a Cloud Run/Cloudflare hostname, a raw IP-shaped
+  // secret URL, anything) directly into repos.json instead of naming an env
+  // var. uki-tutor.com is the one allowed exception — it is the product's
+  // public marketing domain, safe to publish because it already is public.
+  const reposJsonPath = new URL('../repos.json', import.meta.url)
+  const reposJsonText = readFileSync(reposJsonPath, 'utf8')
+
+  const reposJsonPatterns = {
+    ...forbiddenPatterns,
+    'an https:// URL other than uki-tutor.com': /https:\/\/(?!uki-tutor\.com\/?["\s])\S*/i,
+  }
+  assertNoForbiddenPatterns(reposJsonText, reposJsonPatterns)
 })
