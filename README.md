@@ -46,11 +46,13 @@ neutral subject, or hide the release until the mobile build has shipped.
 
 ## Running it locally
 
-Requires Node 22+ and a fine-grained PAT with **Contents: Read-only** on the
-repositories in `repos.json`.
+Requires Node 22+ and a fine-grained PAT with **Contents: Read-only and
+Deployments: Read** on the repositories in `repos.json`. Deployments: Read
+powers the "now live" banners; without it the build still succeeds and just
+publishes without banners.
 
 ```bash
-GH_TOKEN=github_pat_... node scripts/build.mjs
+GH_TOKEN=github_pat_... UKI_TUTOR_SERVICE_PROBE_URL=https://... node scripts/build.mjs
 open site/index.html
 ```
 
@@ -69,7 +71,21 @@ read, so it carries no supply-chain surface.
 
 | Name | Where | Scope |
 |---|---|---|
-| `UKI_RELEASES_READ_PAT` | this repo | fine-grained, Contents: Read-only on the repos in `repos.json` |
+| `UKI_RELEASES_READ_PAT` | this repo | fine-grained, Contents: Read-only **and Deployments: Read** on the repos in `repos.json` |
+| `UKI_TUTOR_SERVICE_PROBE_URL` | this repo | the API's health-check URL, read via `repos.json`'s `probeUrlEnv` |
 
 The product repositories hold a separate, narrower token that can only fire the
 `repository_dispatch` event at this repository.
+
+`UKI_TUTOR_SERVICE_PROBE_URL` is a secret rather than a value in `repos.json`
+because this repository is public and its git history is permanent — a Cloud
+Run hostname committed there would stay readable forever even after a later
+commit removed it. It isn't a credential (the endpoint is publicly
+invocable), but it's an internal address the page must never print, so
+`repos.json` only ever names the *variable*.
+
+There is deliberately no `UKI_ADMIN_SERVICE_PROBE_URL`. The admin service's
+entry in `repos.json` carries no `probeUrl`/`probeUrlEnv`, so its banner
+shows a version with no status dot — a public liveness signal for an
+internal payouts panel serves no reader of this page. That's a decision, not
+a gap to fill in.

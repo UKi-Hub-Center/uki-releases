@@ -17,8 +17,11 @@ of the decisions below.
 ## Commands
 
 ```bash
-# Full build (needs a fine-grained PAT with Contents: Read-only on repos.json's repos)
-GH_TOKEN=github_pat_... node scripts/build.mjs && open site/index.html
+# Full build (needs a fine-grained PAT with Contents: Read-only and
+# Deployments: Read on repos.json's repos — Deployments: Read powers the
+# "now live" banners; without it the build still succeeds, banners just
+# degrade to omitted, see computeServiceBanner in fetch.mjs)
+GH_TOKEN=github_pat_... UKI_TUTOR_SERVICE_PROBE_URL=https://... node scripts/build.mjs && open site/index.html
 
 # Tests — no token needed, run in CI before anything is deployed
 node --test 'scripts/*.test.mjs'
@@ -84,6 +87,26 @@ builds do not, so a note describing a vulnerability may describe a live one in b
 users are still running. Give those a neutral subject, or hide the release until the
 mobile build has shipped.
 
-Secret: `UKI_RELEASES_READ_PAT` (this repo, fine-grained, Contents: Read-only). A 404
-from the API on a private repo nearly always means the PAT does not cover it or its
-grant was not approved — `fetch.mjs` says so in the error, since the API will not.
+Secrets:
+
+- `UKI_RELEASES_READ_PAT` (this repo, fine-grained, **Contents: Read-only and
+  Deployments: Read** on the repos in `repos.json`). A 404 from the API on a
+  private repo nearly always means the PAT does not cover it or its grant was
+  not approved — `fetch.mjs` says so in the error, since the API will not.
+  Deployments: Read is what powers the "now live" banners (Phase A); if this
+  token is ever rotated without that scope, every banner silently disappears
+  — `computeServiceBanner` degrades to `null` and logs why, but nothing turns
+  red, so check the Actions log after a rotation.
+- `UKI_TUTOR_SERVICE_PROBE_URL` (this repo) — the API's health-check URL,
+  read via `repos.json`'s `probeUrlEnv` indirection rather than being a value
+  in `repos.json` itself. This repo is public and its git history is
+  permanent; a Cloud Run hostname committed directly would stay readable
+  forever even after a later commit removed it. It is not a credential (the
+  endpoint is publicly invocable), but it is an internal address the page
+  itself must never print, so `repos.json` names the *variable* and the
+  value arrives only at build time from this secret.
+- There is deliberately no `UKI_ADMIN_SERVICE_PROBE_URL`. The admin service's
+  `repos.json` entry has no `probeUrl`/`probeUrlEnv` at all — its banner
+  shows a version with no status dot, by decision: a public liveness signal
+  for an internal payouts panel serves no reader of this page. Don't add the
+  scaffolding back to "fix" the missing dot.

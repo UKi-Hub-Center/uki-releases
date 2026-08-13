@@ -52,9 +52,31 @@ jobs:
       # client_payload from repository_dispatch is attacker-supplied in
       # principle and is deliberately never read: which repos get published is
       # decided by repos.json in this repo, not by whoever fired the event.
+      # UKI_TUTOR_SERVICE_PROBE_URL is a secret rather than a value in
+      # repos.json for one reason: this repository is public and its history
+      # is permanent. A Cloud Run hostname committed here would stay readable
+      # forever even if a later commit removed it, so repos.json names the
+      # *variable* (probeUrlEnv) and the value arrives at build time. It is
+      # not a credential — the endpoint is publicly invocable — but it is an
+      # internal address the page itself must never print, and keeping it out
+      # of the tree is what makes that structural rather than a rule someone
+      # has to remember. (uki-tutor-ui's probeUrl is the public marketing
+      # domain, so it is fine to commit directly in repos.json.)
+      #
+      # An unset probe URL is not a failure: the banner renders "status
+      # unknown" and the page still publishes, same as any probe that times
+      # out. Same for UKI_RELEASES_READ_PAT lacking Deployments: Read — the
+      # banners are dropped and the release notes publish alone.
+      #
+      # No UKI_ADMIN_SERVICE_PROBE_URL here: this is a decision, not an
+      # oversight. The admin service has no probeUrl/probeUrlEnv in
+      # repos.json, so its banner shows a version with no status dot — a
+      # public liveness signal for an internal payouts panel serves no
+      # reader of this page. Do not add the env line back to "fix" it.
       - name: Build site
         env:
           GH_TOKEN: ${{ secrets.UKI_RELEASES_READ_PAT }}
+          UKI_TUTOR_SERVICE_PROBE_URL: ${{ secrets.UKI_TUTOR_SERVICE_PROBE_URL }}
         run: node scripts/build.mjs
 
       - uses: actions/upload-pages-artifact@v5
