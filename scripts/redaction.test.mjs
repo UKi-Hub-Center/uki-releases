@@ -17,6 +17,8 @@ import {
   computeServiceBanner,
   toPublicSection,
   gatherReleases,
+  gh,
+  rateLimitWaitMs,
 } from './fetch.mjs'
 import { escapeHtml, renderPage } from './render.mjs'
 
@@ -314,6 +316,103 @@ test('probeProd: every attempt fails — retries once, then returns false withou
 test('probeProd: never throws even against a malformed URL', async () => {
   await assert.doesNotReject(() => probeProd('not a valid url', { retries: 0 }))
   assert.equal(await probeProd('not a valid url', { retries: 0 }), false)
+})
+
+// --- gh rate limiting ---------------------------------------------------------
+//
+// The nightly build failed on 2026-08-14 with a bare "403 Forbidden" on a
+// releases fetch. It was throttling, not a missing PAT grant, but the two are
+// indistinguishable by status — which cost an investigation. These cover both
+// halves of the fix: waiting the retryable case out, and naming the other.
+
+process.env.GH_TOKEN ??= 'test-token'
+
+/** Minimal stand-in for a Response; `headers` mimics the real Headers.get. */
+const ghRes = (status, headers = {}, json = null) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  statusText: status === 403 ? 'Forbidden' : status === 200 ? 'OK' : String(status),
+  headers: { get: name => headers[name] ?? null },
+  json: async () => json,
+  text: async () => '',
+})
+
+test('gh: a secondary rate limit (retry-after) is waited out and the retry succeeds', async () => {
+  const slept = []
+  let calls = 0
+  const fetchFn = async () => {
+    calls++
+    return calls === 1 ? ghRes(403, { 'retry-after': '60' }) : ghRes(200, {}, { ok: true })
+  }
+  const result = await gh('/x', {}, { fetchFn, sleep: async ms => slept.push(ms) })
+  assert.deepEqual(result, { ok: true })
+  assert.equal(calls, 2, 'initial attempt plus exactly one retry')
+  assert.deepEqual(slept, [60_000], 'honours retry-after verbatim')
+})
+
+test('gh: a primary rate limit waits until x-ratelimit-reset', async () => {
+  const slept = []
+  const nowMs = 1_700_000_000_000
+  let calls = 0
+  const fetchFn = async () => {
+    calls++
+    return calls === 1
+      ? ghRes(403, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(nowMs / 1000 + 30) })
+      : ghRes(200, {}, [])
+  }
+  await gh('/x', {}, { fetchFn, now: () => nowMs, sleep: async ms => slept.push(ms) })
+  assert.deepEqual(slept, [30_000], 'sleeps exactly until the reset instant')
+})
+
+test('gh: a 403 with no rate-limit headers is a permission denial — not retried, and says so', async () => {
+  let calls = 0
+  const fetchFn = async () => { calls++; return ghRes(403) }
+  await assert.rejects(
+    () => gh('/x', {}, { fetchFn, sleep: async () => {} }),
+    err => {
+      assert.match(err.message, /permission denial rather than throttling/)
+      assert.doesNotMatch(err.message, /rate limited;/)
+      return true
+    },
+  )
+  assert.equal(calls, 1, 'a permission denial must not be retried')
+})
+
+test('gh: a reset further out than the budget fails fast rather than idling the runner', async () => {
+  const slept = []
+  let calls = 0
+  const nowMs = 1_700_000_000_000
+  const fetchFn = async () => {
+    calls++
+    return ghRes(403, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(nowMs / 1000 + 3600) })
+  }
+  await assert.rejects(
+    () => gh('/x', {}, { fetchFn, now: () => nowMs, sleep: async ms => slept.push(ms) }),
+    /rate limited; quota resets at/,
+  )
+  assert.equal(calls, 1)
+  assert.deepEqual(slept, [], 'an hour-out reset is reported, never slept through')
+})
+
+test('gh: retries are bounded — a persistently throttled call gives up and reports the limit', async () => {
+  let calls = 0
+  const fetchFn = async () => { calls++; return ghRes(403, { 'retry-after': '1' }) }
+  await assert.rejects(
+    () => gh('/x', {}, { fetchFn, sleep: async () => {}, rateLimitRetries: 2 }),
+    /rate limited; quota resets at/,
+  )
+  assert.equal(calls, 3, 'initial attempt plus exactly two retries')
+})
+
+test('rateLimitWaitMs: only 403/429 carrying limit headers are retryable', () => {
+  assert.equal(rateLimitWaitMs(ghRes(404, { 'retry-after': '60' })), null, '404 is never a rate limit')
+  assert.equal(rateLimitWaitMs(ghRes(403)), null, 'a bare 403 is a permission denial')
+  assert.equal(
+    rateLimitWaitMs(ghRes(403, { 'x-ratelimit-remaining': '17' })),
+    null,
+    'quota left means the 403 came from something else',
+  )
+  assert.equal(rateLimitWaitMs(ghRes(429, { 'retry-after': '5' })), 5000)
 })
 
 // --- resolveTagIndex ----------------------------------------------------------

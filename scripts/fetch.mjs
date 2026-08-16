@@ -23,27 +23,107 @@ function token() {
   return t
 }
 
-async function gh(path, { method = 'GET', body, accept = 'application/vnd.github+json' } = {}) {
-  const res = await fetch(`${API}${path}`, {
-    method,
-    headers: {
-      accept,
-      authorization: `Bearer ${token()}`,
-      'x-github-api-version': '2022-11-28',
-      ...(body ? { 'content-type': 'application/json' } : {}),
-    },
-    ...(body ? { body: JSON.stringify(body) } : {}),
-  })
-  if (!res.ok) {
+/**
+ * Total time gh() will spend asleep waiting out rate limits across all
+ * attempts on one call. Sized for the *secondary* limit, which is the one
+ * this project actually hits: GitHub asks for ~60s and the burst clears.
+ * A fully exhausted *primary* hourly quota can reset up to an hour out —
+ * past this budget, so it fails fast with the reset time in the message
+ * rather than idling a runner for forty minutes. The nightly is a backstop
+ * that runs again tomorrow, and repository_dispatch re-fires on the next
+ * release; neither is worth an hour of held runner.
+ */
+const RATE_LIMIT_BUDGET_MS = 15 * 60_000
+const RATE_LIMIT_MAX_RETRIES = 3
+
+/** Tolerates the plain `{ ok, status }` stubs the tests pass in place of a Response. */
+function header(res, name) {
+  return res.headers && typeof res.headers.get === 'function' ? res.headers.get(name) : null
+}
+
+/**
+ * How long to wait before retrying, or null when this response is not a rate
+ * limit and retrying would be pointless.
+ *
+ * GitHub signals *both* kinds of throttling with 403, the same status a
+ * missing PAT grant returns — so status alone cannot tell "come back in a
+ * minute" apart from "you will never be allowed to read this". The headers
+ * can: `retry-after` marks a secondary limit, and `x-ratelimit-remaining: 0`
+ * a primary one. Neither is present on a permission denial, which is exactly
+ * what makes them the right discriminator. (429 is accepted too — it is not
+ * what the REST API sends today, but it costs nothing to honour.)
+ */
+export function rateLimitWaitMs(res, nowMs = Date.now()) {
+  if (res.status !== 403 && res.status !== 429) return null
+
+  const retryAfter = Number(header(res, 'retry-after'))
+  if (Number.isFinite(retryAfter) && retryAfter > 0) return retryAfter * 1000
+
+  if (header(res, 'x-ratelimit-remaining') === '0') {
+    const reset = Number(header(res, 'x-ratelimit-reset'))
+    if (Number.isFinite(reset) && reset > 0) return Math.max(0, reset * 1000 - nowMs)
+  }
+  return null
+}
+
+function forbiddenHint(res, waitMs, nowMs) {
+  if (waitMs === null) {
+    // A 403 with no rate-limit headers is a permission denial. Say so, or it
+    // reads as a transient blip and gets retried by hand for an hour.
+    return (
+      ' (no rate-limit headers, so this is a permission denial rather than throttling — ' +
+      'check the PAT still grants this repo)'
+    )
+  }
+  const resetAt = new Date(nowMs + waitMs).toISOString()
+  return (
+    ` (rate limited; quota resets at ${resetAt}. The PAT's limit is shared with every other ` +
+    'use of that token, including local gh calls — a GitHub App installation token would get its own)'
+  )
+}
+
+export async function gh(
+  path,
+  { method = 'GET', body, accept = 'application/vnd.github+json' } = {},
+  deps = {},
+) {
+  const fetchFn = deps.fetchFn ?? fetch
+  const now = deps.now ?? Date.now
+  const sleep = deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)))
+  const maxRetries = deps.rateLimitRetries ?? RATE_LIMIT_MAX_RETRIES
+  let budgetLeft = deps.rateLimitBudgetMs ?? RATE_LIMIT_BUDGET_MS
+
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetchFn(`${API}${path}`, {
+      method,
+      headers: {
+        accept,
+        authorization: `Bearer ${token()}`,
+        'x-github-api-version': '2022-11-28',
+        ...(body ? { 'content-type': 'application/json' } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    })
+    if (res.ok) return accept.includes('json') ? res.json() : res.text()
+
+    const nowMs = now()
+    const waitMs = rateLimitWaitMs(res, nowMs)
+    if (waitMs !== null && attempt < maxRetries && waitMs <= budgetLeft) {
+      budgetLeft -= waitMs
+      await sleep(waitMs)
+      continue
+    }
+
     // 404 on a private repo almost always means the PAT does not grant it,
     // not that the repo is missing — say so, because the API will not.
-    const hint =
-      res.status === 404
-        ? ' (for a private repo this usually means the PAT does not include it, or its grant was not approved)'
-        : ''
+    let hint = ''
+    if (res.status === 404) {
+      hint = ' (for a private repo this usually means the PAT does not include it, or its grant was not approved)'
+    } else if (res.status === 403 || res.status === 429) {
+      hint = forbiddenHint(res, waitMs, nowMs)
+    }
     throw new Error(`GitHub ${method} ${path} -> ${res.status} ${res.statusText}${hint}`)
   }
-  return accept.includes('json') ? res.json() : res.text()
 }
 
 /**
