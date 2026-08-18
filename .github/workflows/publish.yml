@@ -11,7 +11,16 @@ name: Publish release site
 # right after release-please publishes a release. The nightly schedule is the
 # backstop, because that ping is best-effort by design — a failed dispatch must
 # never turn a completed release red in the repo that produced it.
+#
+# pull_request runs the tests and nothing else: no secret, no artifact, no
+# deploy. Until it was added, the first thing to execute the tests was the
+# same job that published, so every change reached the public page unverified.
+# The build itself is deliberately not run on a PR — build.mjs needs the PAT,
+# which a fork PR never receives, and a full build spends ~40 calls of the
+# very rate limit this repo already contends for.
 on:
+  pull_request:
+    branches: [main]
   repository_dispatch:
     types: [release-published]
   push:
@@ -25,8 +34,10 @@ permissions:
   pages: write
   id-token: write
 
+# Real publishes stay serialized under one `pages` group. A PR gets its own
+# group so it can never queue ahead of, or delay, a live publish.
 concurrency:
-  group: pages
+  group: ${{ github.event_name == 'pull_request' && format('pages-pr-{0}', github.event.pull_request.number) || 'pages' }}
   cancel-in-progress: false
 
 jobs:
@@ -74,17 +85,20 @@ jobs:
       # public liveness signal for an internal payouts panel serves no
       # reader of this page. Do not add the env line back to "fix" it.
       - name: Build site
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.UKI_RELEASES_READ_PAT }}
           UKI_TUTOR_SERVICE_PROBE_URL: ${{ secrets.UKI_TUTOR_SERVICE_PROBE_URL }}
         run: node scripts/build.mjs
 
       - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
         with:
           path: site
 
   deploy:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
