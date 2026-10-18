@@ -27,8 +27,12 @@ built here, from a repository whose entire contents are the thing being served.
    `site/index.html`.
 4. `.github/workflows/publish.yml` deploys `site/` to GitHub Pages.
 
-It runs when a product repository reports a new release (`repository_dispatch`),
-on every push here, nightly as a backstop, and on demand.
+It runs when a product repository reports a new release (a `repository_dispatch`
+of type `release-published`, sent by each product repo's `release.yml` right after
+release-please publishes), on every push to `main` here, nightly at 06:00 UTC as a
+backstop, and on demand. Pull requests run the redaction tests only — no secret,
+no build, no deploy. The dispatch is best-effort by design, so a missed one shows
+up as a page that catches up on the nightly run, never as a red release.
 
 ## Keeping something off the page
 
@@ -74,8 +78,13 @@ read, so it carries no supply-chain surface.
 | `UKI_RELEASES_READ_PAT` | this repo | fine-grained, Contents: Read-only **and Deployments: Read** on the repos in `repos.json` |
 | `UKI_TUTOR_SERVICE_PROBE_URL` | this repo | the API's health-check URL, read via `repos.json`'s `probeUrlEnv` |
 
-The product repositories hold a separate, narrower token that can only fire the
-`repository_dispatch` event at this repository.
+The product repositories hold no token for this repository. Each one's
+`release.yml` mints a short-lived GitHub App installation token per run (the
+"UKi Release Bot", from the `RELEASE_APP_CLIENT_ID` / `RELEASE_APP_PRIVATE_KEY`
+secrets) downscoped to `repositories: uki-releases` and `permission-contents:
+write`, which is exactly what `POST /dispatches` needs. It replaced a
+`UKI_RELEASES_DISPATCH_PAT` that was never set, so until then the page only ever
+refreshed on its nightly run.
 
 `UKI_TUTOR_SERVICE_PROBE_URL` is a secret rather than a value in `repos.json`
 because this repository is public and its git history is permanent — a Cloud
