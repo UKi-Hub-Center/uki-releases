@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository is
 
-A ~350-line static-site generator that publishes the UKi-Tutor platform's public
+A ~700-line static-site generator that publishes the UKi-Tutor platform's public
 release-notes page to GitHub Pages (https://uki-hub-center.github.io/uki-releases/).
 It contains **no product source code**. Everything it publishes is read at build
 time from the GitHub Releases of three private product repos named in `repos.json`.
@@ -71,7 +71,10 @@ passing and extend it alongside any change here.
 
 `.github/workflows/publish.yml` triggers on `repository_dispatch`
 (`release-published`, fired by each product repo after release-please), every push to
-`main`, nightly at 06:00 UTC as a backstop, and manually. The dispatch ping is
+`main`, nightly at 06:00 UTC as a backstop, and manually. It also runs on every
+`pull_request` to `main`, but only the tests: no secret, no build, no artifact, no
+deploy, in its own concurrency group so a PR never queues ahead of a live publish
+(`build.mjs` needs the PAT, which a fork PR never receives). The dispatch ping is
 best-effort by design — a failed dispatch must never turn a completed release red in
 the repo that produced it. `client_payload` is deliberately never read: what gets
 published is decided by `repos.json` here, not by whoever fired the event.
